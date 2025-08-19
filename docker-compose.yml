@@ -1,13 +1,16 @@
+# docker-compose.yml
 version: '3.8'
 
 services:
   bot:
     build:
-      dockerfile: Dockerfile
       context: .
+      dockerfile: Dockerfile
     ports:
-      - 8000:8000
+      - "9000:8000"
     environment:
-      DEBUG: 1
-      SECRET_KEY: '2rwns^_yyzwtv*x7h(cw#+jx#k0-9v)o+&l2p@l1c*f9mb*#&q'
-
+      DEBUG: "1"
+      DJANGO_ALLOWED_HOSTS: "localhost 127.0.0.1 [::1] 88.222.213.214"
+    volumes:
+      - ./profiles:/var/app/profiles
+      - ./recordings:/var/app/recordings

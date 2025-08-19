@@ -1,12 +1,12 @@
 # botserver/meetbot.py
 import os
-import sys
 import time
 import platform
 import subprocess
 import argparse
 import shutil
 import atexit
+import tempfile
 from pathlib import Path
 from threading import Thread
 
@@ -19,9 +19,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 
-# ========= Helpers =========
 def remove_singleton_locks(folder: Path):
-    """Xóa các file lock nếu còn sót lại (do crash) để tránh 'profile in use'."""
     for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
         p = folder / name
         if p.exists():
@@ -31,7 +29,6 @@ def remove_singleton_locks(folder: Path):
                 pass
 
 
-# ========= Bot class =========
 class MeetBot:
     def __init__(
         self,
@@ -39,7 +36,7 @@ class MeetBot:
         profile_dir: str = "./profiles",
         profile_name: str = "meetbot",
         headless: bool = False,
-        min_members: int = 2,
+        min_members: int = 1,
         min_record_seconds: int = 200,
         bot_name: str = "Recorder Bot",
     ):
@@ -58,34 +55,36 @@ class MeetBot:
 
         self.browser = None
         self.rec_proc = None
+        self.rec_output_path = None
+
+        # profile tạm cho mỗi lần chạy
+        self._tmp_profile = Path(tempfile.mkdtemp(prefix="meetbot_", dir="/tmp")).resolve()
 
     # ---------- Chrome ----------
     def _build_driver(self):
+        W = os.getenv("REC_WIDTH", "1920")
+        H = os.getenv("REC_HEIGHT", "1080")
         opts = webdriver.ChromeOptions()
-
-        # Dùng profile riêng (đã seed login hoặc để guest dùng tên bot)
-        opts.add_argument(f"--user-data-dir={str(self.profile_root)}")
+        opts.add_argument(f"--user-data-dir={str(self._tmp_profile)}")
         opts.add_argument("--profile-directory=Default")
-
-        # Giảm popups
         opts.add_argument("--use-fake-ui-for-media-stream")
         opts.add_argument("--disable-notifications")
         opts.add_argument("--no-first-run")
         opts.add_argument("--no-default-browser-check")
-
-        # Giảm dấu vết automation (không vượt cơ chế bảo mật)
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
         opts.add_argument("--disable-blink-features=AutomationControlled")
-
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument(f"--window-size={W},{H}")
+        opts.add_argument("--window-position=0,0")
+        opts.add_argument("--start-fullscreen")
         if self.headless:
-            # Tránh headless khi cần ổn định login; nếu đã seed cookie có thể bật.
             opts.add_argument("--headless=new")
-            opts.add_argument("--window-size=1280,800")
+            opts.add_argument("--window-size=1920,1080")
 
         service = Service(ChromeDriverManager().install())
         self.browser = webdriver.Chrome(service=service, options=opts)
-
         atexit.register(self._quit_driver)
 
     def _quit_driver(self):
@@ -95,54 +94,79 @@ class MeetBot:
         except Exception:
             pass
         remove_singleton_locks(self.profile_root)
+        try:
+            if self._tmp_profile and self._tmp_profile.exists():
+                shutil.rmtree(self._tmp_profile, ignore_errors=True)
+        except Exception:
+            pass
 
-    # ---------- Recorder ----------
+    # ---------- Recorder (FULLSCREEN + HIGH QUALITY) ----------
     def _recorder_run(self):
         """
-        macOS: dùng avfoundation để ghi màn hình. Nếu cần ghi system audio,
-        cài BlackHole và thay 'screen_index:none' -> 'screen_index:audio_index'.
-        Xem thiết bị: ffmpeg -f avfoundation -list_devices true -i ""
-        """
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        if platform.system() == "Darwin":
-            # Đổi "1:none" theo index màn hình và audio của bạn
-            cmd = [
-                "ffmpeg",
-                "-f", "avfoundation",
-                "-r", "25",
-                "-i", "1:none",  # ví dụ chỉ ghi hình, không ghi system audio
-                "-pix_fmt", "yuv420p",
-                "-preset", "ultrafast",
-                "-crf", "18",
-                "-y", f"./output-{ts}.mp4",
-            ]
-        else:
-            # Linux: X11 + Pulse (điều chỉnh nguồn audio và kích thước nếu cần)
-            cmd = (
-                "ffmpeg -f pulse -ac 2 -i default "
-                "-f x11grab -r 25 -s 1920x1080 -i :0.0 "
-                "-vcodec libx264 -pix_fmt yuv420p -preset ultrafast -crf 18 "
-                "-acodec aac -b:a 128k -y "
-                f"./output-{ts}.mkv"
-            ).split()
+        Bắt đầu ffmpeg ghi màn hình sau khi đã join thành công.
 
+        Tuỳ biến bằng env:
+          - REC_FPS (mặc định 30)
+          - REC_WIDTH, REC_HEIGHT (mặc định 1920x1080; khớp Xvfb)
+          - REC_LOSSLESS=1|0 (mặc định 1: CRF 0 lossless; 0: CRF 14 rất nét)
+          - REC_DIR (Linux: mặc định /var/app/recordings; macOS: ./recordings)
+        """
+        print("[meetbot] Starting screen recorder (fullscreen, high quality)...")
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        fps = int(os.getenv("REC_FPS", "30"))
+        lossless = os.getenv("REC_LOSSLESS", "1").lower() in ("1", "true", "yes")
+
+        # Linux/Docker: dùng Xvfb DISPLAY
+        disp = os.environ.get("DISPLAY", ":99")
+        out_dir = Path(os.getenv("REC_DIR", "/var/app/recordings"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = str(out_dir / f"output-{ts}.mkv")
+
+        width = os.getenv("REC_WIDTH", "1920")
+        height = os.getenv("REC_HEIGHT", "1080")
+        # Xvfb phải chạy đúng kích thước này trong entrypoint.sh
+        # Xvfb :99 -screen 0 {width}x{height}x24
+
+        v_args = ["-crf", "0"] if lossless else ["-crf", "23"]
+        preset = ["-preset", "medium"]
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            # Audio: Pulse ‘default’ (nếu bạn không cần audio, có thể đổi -an)
+            "-f", "pulse", "-ac", "2", "-i", "default",
+            # Video: x11grab toàn màn hình DISPLAY
+            "-f", "x11grab",
+            "-framerate", str(fps),
+            "-video_size", f"{width}x{height}",
+            "-i", disp,
+            "-c:v", "libx265",
+            *v_args,
+            *preset,
+            "-pix_fmt", "yuv420p",
+            # Audio encode: AAC 192k (có thể tăng 256k/320k)
+            "-c:a", "aac", "-b:a", "192k",
+            out_path,
+        ]
+
+        self.rec_output_path = out_path
         self.rec_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     def _recorder_stop(self):
         try:
-            if self.rec_proc:
+            if self.rec_proc and self.rec_proc.poll() is None:
+                print("[meetbot] Stopping screen recorder...")
                 self.rec_proc.terminate()
+                try:
+                    self.rec_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.rec_proc.kill()
         except Exception:
             pass
 
-    # ---------- Guest helpers ----------
+    # ---------- UI helpers ----------
     def _fill_guest_name_if_needed(self):
-        """
-        Nếu trang yêu cầu nhập tên (guest flow), điền self.bot_name.
-        Thử nhiều locator để chịu đa ngôn ngữ/biến thể UI.
-        """
         wait = WebDriverWait(self.browser, 10)
-        name_input = None
         candidates = [
             (By.CSS_SELECTOR, 'input[aria-label="Your name"]'),
             (By.CSS_SELECTOR, 'input[aria-label="Tên của bạn"]'),
@@ -153,35 +177,24 @@ class MeetBot:
             try:
                 el = wait.until(EC.presence_of_element_located((how, sel)))
                 if el and el.is_displayed():
-                    name_input = el
-                    break
+                    try:
+                        el.clear()
+                    except Exception:
+                        pass
+                    el.send_keys(self.bot_name)
+                    time.sleep(0.4)
+                    return True
             except Exception:
                 pass
-
-        if name_input:
-            try:
-                name_input.clear()
-            except Exception:
-                pass
-            name_input.send_keys(self.bot_name)
-            time.sleep(0.5)
-            return True
         return False
 
     def _click_ask_to_join(self):
-        """
-        Bấm nút 'Ask to join' / 'Yêu cầu tham gia' / 'Tham gia' (khi là khách).
-        Dùng nhiều cách dò để chịu đổi ngôn ngữ.
-        """
         wait = WebDriverWait(self.browser, 10)
         xpaths = [
-            # Nút có text
             '//button[.//span[normalize-space(text())="Ask to join"]]',
             '//button[.//span[normalize-space(text())="Yêu cầu tham gia"]]',
             '//button[.//span[normalize-space(text())="Tham gia"]]',
-            # Nút chính theo class cũ
             '//*[contains(concat(" ", normalize-space(@class), " "), " snByac ")]',
-            # Button role + text chứa 'join'/'tham gia'
             '//*[@role="button" and .//span[contains(translate(normalize-space(.),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "join") or contains(normalize-space(.), "tham gia")]]',
         ]
         for xp in xpaths:
@@ -191,65 +204,90 @@ class MeetBot:
                 return True
             except Exception:
                 pass
-
-        # Thử JS click "Join now" theo class Desktop cũ
         try:
             self.browser.execute_script('document.getElementsByClassName("snByac")[1]?.click?.()')
             return True
         except Exception:
             return False
 
+    def _is_in_call(self) -> bool:
+        wait = WebDriverWait(self.browser, 2)
+        leave_selectors = [
+            (By.CSS_SELECTOR, 'button[aria-label="Leave call"]'),
+            (By.CSS_SELECTOR, 'div[aria-label="Leave call"]'),
+            (By.XPATH, '//*[@aria-label="Leave call"]'),
+            (By.XPATH, '//*[@aria-label="Rời cuộc gọi"]'),
+            (By.XPATH, '//*[@aria-label="Kết thúc cuộc gọi"]'),
+            (By.XPATH, '//*[@data-tooltip="Leave call" or @data-tooltip="Rời cuộc gọi" or @data-tooltip="Kết thúc cuộc gọi"]'),
+        ]
+        for how, sel in leave_selectors:
+            try:
+                el = wait.until(EC.presence_of_element_located((how, sel)))
+                if el and el.is_displayed():
+                    return True
+            except Exception:
+                pass
+
+        lobby_signals = [
+            '//*[contains(., "Ask to join") or contains(., "Yêu cầu tham gia")]',
+            '//*[contains(., "Return to home screen")]',
+            '//*[contains(., "You’ve been removed") or contains(., "Bạn đã bị xóa khỏi cuộc họp")]',
+            '//*[contains(., "has ended") or contains(., "đã kết thúc") or contains(., "cuộc họp đã kết thúc")]',
+            '//*[contains(., "Ready to join") or contains(., "Sẵn sàng tham gia")]',
+        ]
+        for xp in lobby_signals:
+            try:
+                el = self.browser.find_element(By.XPATH, xp)
+                if el and el.is_displayed():
+                    return False
+            except Exception:
+                pass
+        return False
+
+    def _wait_until_joined(self, timeout=600):
+        print(f"[meetbot] Waiting to be admitted (≤ {timeout}s)...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._is_in_call():
+                print("[meetbot] Admitted. Join confirmed.")
+                return True
+            time.sleep(2)
+        print("[meetbot] Waited too long but not admitted. Stop.")
+        return False
+
     # ---------- Meet flow ----------
     def _meet_join(self):
         self.browser.get(self.meet_link)
+        try:
+            w = int(os.getenv("REC_WIDTH", "1920"))
+            h = int(os.getenv("REC_HEIGHT", "1080"))
+            self.browser.set_window_position(0, 0)
+            self.browser.set_window_size(w, h)
+        except Exception:
+            pass
         time.sleep(6)
 
         is_mac = platform.system() == "Darwin"
         META = Keys.COMMAND if is_mac else Keys.CONTROL
-
-        # tắt cam + mic (Cmd/Ctrl + e, d)
         try:
             body = self.browser.find_element(By.TAG_NAME, "body")
             body.send_keys(META + "e")
             body.send_keys(META + "d")
-            time.sleep(1.5)
+            time.sleep(1.0)
         except Exception:
             pass
 
-        # Guest: điền tên nếu thấy input name
         self._fill_guest_name_if_needed()
-
-        # Bấm Ask to join (guest) hoặc Join now (account đã login)
         self._click_ask_to_join()
+        time.sleep(2)
 
-        # Chờ trạng thái chuyển tiếp
-        time.sleep(5)
-
-    def _meeting_watch(self):
-        tic = time.perf_counter()
+    def _meeting_watch(self, joined_at: float):
         while True:
-            meetingleft = ""
-            # Nếu bị đẩy về màn hình home, reload và join lại
-            for classname in ["j7nIZb", "nS35F"]:
+            if not self._is_in_call():
+                print("[meetbot] Not in call anymore (kicked/ended/disconnected).")
+                break
+            if (time.time() - joined_at) > self.min_record_seconds:
                 try:
-                    elem = self.browser.find_element(
-                        By.XPATH,
-                        f'//*[contains(concat(" ", normalize-space(@class), " "), " {classname} ")]'
-                        f'//*[contains(concat(" ", normalize-space(@class), " "), " snByac ")]'
-                    )
-                    meetingleft = (elem.text or "").strip()
-                    if meetingleft == "Return to home screen":
-                        self.browser.execute_script("location.reload();")
-                        self._meet_join()
-                        break
-                except Exception:
-                    pass
-
-            # Sau thời gian tối thiểu, kiểm tra số người để quyết định rời
-            toc = time.perf_counter()
-            if (toc - tic) > self.min_record_seconds:
-                try:
-                    # ⚠️ XPath phụ thuộc UI Meet, có thể cần cập nhật theo thời gian
                     mem_text = self.browser.find_element(
                         By.XPATH,
                         '//*[@id="ow3"]/div[1]/div/div[4]/div[3]/div[6]/div[3]/div/div[2]/div[1]/span/span/div/div/span[2]'
@@ -257,23 +295,25 @@ class MeetBot:
                     members = int(mem_text)
                     print(f"[meetbot] Participants: {members}")
                     if members < self.min_members:
+                        print("[meetbot] Below threshold. Stopping...")
                         break
                 except Exception:
-                    # Không đọc được số người -> bỏ qua lần này
                     pass
-
-            time.sleep(6)
+            time.sleep(4)
 
     def run(self):
         self._build_driver()
         self._meet_join()
 
-        t_rec = Thread(target=self._recorder_run, daemon=True)
-        t_mon = Thread(target=self._meeting_watch, daemon=True)
+        if not self._wait_until_joined(timeout=600):
+            self._quit_driver()
+            return
 
+        joined_at = time.time()
+        t_rec = Thread(target=self._recorder_run, daemon=True)
+        t_mon = Thread(target=self._meeting_watch, args=(joined_at,), daemon=True)
         t_rec.start()
         t_mon.start()
-
         try:
             t_mon.join()
         finally:
@@ -281,13 +321,12 @@ class MeetBot:
             self._quit_driver()
 
 
-# ========= Public API (để Django view gọi) =========
 def run_bot(
     meet_link: str,
     profile_dir: str = "./profiles",
     profile_name: str = "meetbot",
     headless: bool = False,
-    min_members: int = 2,
+    min_members: int = 1,
     min_record_seconds: int = 200,
     bot_name: str = "Recorder Bot",
 ):
@@ -303,16 +342,15 @@ def run_bot(
     bot.run()
 
 
-# ========= CLI =========
 def _parse_args():
-    p = argparse.ArgumentParser(description="Google Meet Bot (macOS-ready)")
+    p = argparse.ArgumentParser(description="Google Meet Bot (record AFTER admit; fullscreen, high-quality)")
     p.add_argument("meetlink", help="Google Meet link, e.g. https://meet.google.com/abc-defg-hij")
-    p.add_argument("--profile-dir", default="./profiles", help="Base folder to store bot profiles")
-    p.add_argument("--profile-name", default="meetbot", help="Profile name under profile-dir")
-    p.add_argument("--headless", action="store_true", help="Run Chrome headless (not recommended for login)")
-    p.add_argument("--min-members", type=int, default=2, help="Leave meeting if participants drop below this")
-    p.add_argument("--min-record-seconds", type=int, default=200, help="Minimum recording time before checking members")
-    p.add_argument("--bot-name", default="Recorder Bot", help="Display name for guest join flow")
+    p.add_argument("--profile-dir", default="./profiles")
+    p.add_argument("--profile-name", default="meetbot")
+    p.add_argument("--headless", action="store_true")
+    p.add_argument("--min-members", type=int, default=1)
+    p.add_argument("--min-record-seconds", type=int, default=200)
+    p.add_argument("--bot-name", default="Recorder Bot")
     return p.parse_args()
 
 
