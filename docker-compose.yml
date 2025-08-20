@@ -10,7 +10,14 @@ services:
       - "9000:8000"
     environment:
       DEBUG: "1"
-      DJANGO_ALLOWED_HOSTS: "localhost 127.0.0.1 [::1] 88.222.213.214"
+      DJANGO_ALLOWED_HOSTS: "localhost 127.0.0.1 [::1] 88.222.213.214 record-meet.raijin.site"
+      SECRET_KEY: "2rwns^_yyzwtv*x7h(cw#+jx#k0-9v)o+&l2p@l1c*f9mb*#&q"
+      WEBHOOK_URL: "https://n8n.raijin.site/webhook/09494127-d967-4fc2-8d47-49998a998e11"
+      REC_PUBLIC_BASE: "https://record-meet.raijin.site/api/recordings"
+      REC_WIDTH: "1366"
+      REC_HEIGHT: "768"
+      REC_FPS: "15"
+      REC_LOSSLESS: "0"
     volumes:
       - ./profiles:/var/app/profiles
       - ./recordings:/var/app/recordings

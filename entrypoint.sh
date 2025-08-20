@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Start Xvfb (màn hình ảo)
-Xvfb :99 -screen 0 1920x1080x24 -ac &
+X_RES="${REC_WIDTH:-1366}"
+Y_RES="${REC_HEIGHT:-768}"
+Xvfb :99 -screen 0 ${X_RES}x${Y_RES}x24 -ac &
 sleep 0.5
 
 # Start PulseAudio (để ffmpeg có đầu vào audio nếu bạn cấu hình)

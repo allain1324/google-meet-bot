@@ -7,6 +7,8 @@ import argparse
 import shutil
 import atexit
 import tempfile
+import json
+import urllib.request, urllib.error
 from pathlib import Path
 from threading import Thread
 
@@ -56,14 +58,19 @@ class MeetBot:
         self.browser = None
         self.rec_proc = None
         self.rec_output_path = None
+        
+        self.webhook_url = os.getenv("WEBHOOK_URL", "").strip() or None
+        self.public_base = os.getenv("REC_PUBLIC_BASE", "").rstrip("/")
+        self.message_id = os.getenv("MESSAGE_ID", "").strip() or None
 
         # profile tạm cho mỗi lần chạy
         self._tmp_profile = Path(tempfile.mkdtemp(prefix="meetbot_", dir="/tmp")).resolve()
 
     # ---------- Chrome ----------
     def _build_driver(self):
-        W = os.getenv("REC_WIDTH", "1920")
-        H = os.getenv("REC_HEIGHT", "1080")
+        print('Building Chrome driver...')
+        W = os.getenv("REC_WIDTH", "1366")
+        H = os.getenv("REC_HEIGHT", "768")
         opts = webdriver.ChromeOptions()
         opts.add_argument(f"--user-data-dir={str(self._tmp_profile)}")
         opts.add_argument("--profile-directory=Default")
@@ -78,7 +85,8 @@ class MeetBot:
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument(f"--window-size={W},{H}")
         opts.add_argument("--window-position=0,0")
-        opts.add_argument("--start-fullscreen")
+        opts.add_argument("--force-device-scale-factor=1")
+        opts.add_argument("--high-dpi-support=1")
         if self.headless:
             opts.add_argument("--headless=new")
             opts.add_argument("--window-size=1920,1080")
@@ -106,51 +114,45 @@ class MeetBot:
         Bắt đầu ffmpeg ghi màn hình sau khi đã join thành công.
 
         Tuỳ biến bằng env:
-          - REC_FPS (mặc định 30)
+          - REC_FPS (mặc định 15)
           - REC_WIDTH, REC_HEIGHT (mặc định 1920x1080; khớp Xvfb)
           - REC_LOSSLESS=1|0 (mặc định 1: CRF 0 lossless; 0: CRF 14 rất nét)
           - REC_DIR (Linux: mặc định /var/app/recordings; macOS: ./recordings)
         """
         print("[meetbot] Starting screen recorder (fullscreen, high quality)...")
         ts = time.strftime("%Y%m%d-%H%M%S")
-        fps = int(os.getenv("REC_FPS", "30"))
-        lossless = os.getenv("REC_LOSSLESS", "1").lower() in ("1", "true", "yes")
+        fps = int(os.getenv("REC_FPS", "15"))
+        lossless = os.getenv("REC_LOSSLESS", "0").lower() in ("1","true","yes")
 
         # Linux/Docker: dùng Xvfb DISPLAY
         disp = os.environ.get("DISPLAY", ":99")
         out_dir = Path(os.getenv("REC_DIR", "/var/app/recordings"))
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = str(out_dir / f"output-{ts}.mkv")
+        rec_out_env = os.getenv("REC_OUT", "").strip()
+        if rec_out_env:
+            out_path = str(out_dir / rec_out_env)  # chỉ là "tên file", không path tuyệt đối
+        else:
+            out_path = str(out_dir / f"output-{ts}.mkv")
 
-        width = os.getenv("REC_WIDTH", "1920")
-        height = os.getenv("REC_HEIGHT", "1080")
+        width = os.getenv("REC_WIDTH", "1366")
+        height = os.getenv("REC_HEIGHT", "768")  
         # Xvfb phải chạy đúng kích thước này trong entrypoint.sh
         # Xvfb :99 -screen 0 {width}x{height}x24
 
-        v_args = ["-crf", "0"] if lossless else ["-crf", "23"]
+        v_args = ["-crf", "26"] if not lossless else ["-crf", "0"]
         preset = ["-preset", "medium"]
 
         cmd = [
-            "ffmpeg",
-            "-y",
-            # Audio: Pulse ‘default’ (nếu bạn không cần audio, có thể đổi -an)
-            "-f", "pulse", "-ac", "2", "-i", "default",
-            # Video: x11grab toàn màn hình DISPLAY
-            "-f", "x11grab",
-            "-framerate", str(fps),
-            "-video_size", f"{width}x{height}",
-            "-i", disp,
-            "-c:v", "libx265",
-            *v_args,
-            *preset,
-            "-pix_fmt", "yuv420p",
-            # Audio encode: AAC 192k (có thể tăng 256k/320k)
-            "-c:a", "aac", "-b:a", "192k",
-            out_path,
+            "ffmpeg","-y",
+            "-f","pulse","-ac","1","-i","default",        # -ac 1 : mono
+            "-f","x11grab","-framerate",str(fps),"-video_size",f"{width}x{height}","-i",disp,
+            "-c:v","libx265", *v_args, "-preset","medium", "-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","64k","-ac","1","-ar","48000",  # 192k stereo -> 64k mono
+            out_path
         ]
 
         self.rec_output_path = out_path
-        self.rec_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.rec_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
 
     def _recorder_stop(self):
         try:
@@ -255,6 +257,58 @@ class MeetBot:
         print("[meetbot] Waited too long but not admitted. Stop.")
         return False
 
+    def _dismiss_popups(self):
+        """Tự động bấm các nút 'Got it' / 'Đã hiểu' nếu xuất hiện."""
+        try:
+            wait = WebDriverWait(self.browser, 2)
+            buttons = [
+                '//button[.//span[normalize-space(text())="Got it"]]',
+                '//button[.//span[normalize-space(text())="Đã hiểu"]]',
+                '//*[normalize-space(text())="Got it"]',
+                '//*[normalize-space(text())="Đã hiểu"]'
+            ]
+            for xp in buttons:
+                try:
+                    btn = wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+                    if btn and btn.is_displayed():
+                        btn.click()
+                        print("[meetbot] Dismissed popup (Got it).")
+                        time.sleep(0.3)
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+    
+    def _notify_webhook(self, event: str):
+        if not self.webhook_url:
+            return
+        try:
+            fname = Path(self.rec_output_path).name if self.rec_output_path else None
+            payload = {
+                "event": event,                       # 'record_stopped'
+                "filename": fname,                    # ví dụ: rec-xxxx.mkv
+                "full_path": self.rec_output_path,    # đường dẫn trên server
+                "meet_link": self.meet_link,
+                "timestamp": int(time.time()),
+                "message_id": self.message_id
+            }
+            if self.public_base and fname:
+                payload["file_url"] = f"{self.public_base}/{fname}"   # vd: http://.../api/recordings/rec-xxxx.mkv"
+
+            req = urllib.request.Request(
+                self.webhook_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            urllib.request.urlopen(req, timeout=5).read()  # không chặn lâu
+            print(f"[meetbot] Webhook sent: {self.webhook_url}")
+        except Exception as e:
+            print(f"[meetbot] Webhook error: {e}")
+
+
     # ---------- Meet flow ----------
     def _meet_join(self):
         self.browser.get(self.meet_link)
@@ -283,6 +337,7 @@ class MeetBot:
 
     def _meeting_watch(self, joined_at: float):
         while True:
+            self._dismiss_popups()
             if not self._is_in_call():
                 print("[meetbot] Not in call anymore (kicked/ended/disconnected).")
                 break
@@ -318,6 +373,7 @@ class MeetBot:
             t_mon.join()
         finally:
             self._recorder_stop()
+            self._notify_webhook(event="record_stopped")
             self._quit_driver()
 
 
